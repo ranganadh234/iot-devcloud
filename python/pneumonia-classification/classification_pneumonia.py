@@ -4,10 +4,9 @@ import os,glob
 import numpy as np
 import logging as log
 from time import time
-from openvino.inference_engine import IENetwork, IEPlugin
+from openvino.inference_engine import IENetwork, IECore
 from PIL import Image
 from argparse import ArgumentParser
-from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 from PIL import Image
 from matplotlib import cm
@@ -30,8 +29,8 @@ def float16_conversion_array(n_array):
     c1=np.array([float16_conversion(xi) for xi in c]).reshape(n_array.shape)
     return c1
 
-def class_activation_map_openvino(res, convb, fc, net, fp16):
-    res_bn = res[convb]
+def class_activation_map_openvino(res, res_bn, fc, net, fp16):
+    #res_bn = res[convb]
     conv_outputs=res_bn[0,:,:,:]
     weights_fc=net.layers.get(fc).weights["weights"]
     cam = np.zeros(dtype=np.float32, shape=conv_outputs.shape[1:])
@@ -63,6 +62,8 @@ def build_argparser():
     parser.add_argument("-pc", "--perf_counts", help="Report performance counters", default=False, action="store_true")
     parser.add_argument("-o", "--output_dir", help="If set, it will write a video here instead of displaying it",
                         default=None, type=str)
+    parser.add_argument("-nireq", "--number_infer_requests", help='Number of parallel inference requests (default is 2).',
+                        type=int, required=False, default=2)
 
     return parser
 
@@ -83,7 +84,8 @@ def main():
         fp16=False
 
     # Plugin initialization for specified device and load extensions library if specified
-    plugin = IEPlugin(device=device)
+    #plugin = IEPlugin(device=device)
+    ie = IECore()
 
     # Read IR
     net = IENetwork(model=model_xml, weights=model_bin)
@@ -102,9 +104,10 @@ def main():
 
     net.batch_size = 1
 
-    exec_net = plugin.load(network=net)
+    #exec_net = plugin.load(network=net)
 
     n,c,h,w=net.inputs[input_blob].shape
+    print("args.input[0]:",args.input[0])
     files=glob.glob(os.getcwd()+args.input[0])
     
     
@@ -116,59 +119,82 @@ def main():
     print(progress_file_path)
     time_images=[]
     tstart=time.time()
+    if args.number_iter < args.number_infer_requests:
+        args.number_infer_requests = args.number_iter
     for index_f, file in enumerate(files):
+        exec_net = ie.load_network(network=net, device_name=device, num_requests=args.number_infer_requests)
+        cur_infer = 0
+        prev_infer = 1 - args.number_infer_requests
         [image1,image]= read_image(file)
         t0 = time.time()
+        is_inference_done = False
         for i in range(args.number_iter):
-            res = exec_net.infer(inputs={input_blob: image1})
-            #infer_time.append((time()-t0)*1000)
-        infer_time = (time.time() - t0)*1000
-        log.info("Average running time of one iteration: {} ms".format(np.average(np.asarray(infer_time))))
-        if args.perf_counts:
-            perf_counts = exec_net.requests[0].get_perf_counts()
-            log.info("Performance counters:")
-            print("{:<70} {:<15} {:<15} {:<15} {:<10}".format('name', 'layer_type', 'exet_type', 'status', 'real_time, us'))
-            for layer, stats in perf_counts.items():
-                print("{:<70} {:<15} {:<15} {:<15} {:<10}".format(layer, stats['layer_type'], stats['exec_type'],
+            if image1.any() != None:
+                res = exec_net.start_async(request_id=cur_infer,inputs={input_blob: image1})
+            if prev_infer >= 0:
+                if exec_net.requests[prev_infer].wait(-1) == 0:
+                    res_pb = exec_net.requests[prev_infer].outputs[out_blob]
+                    res_bn=exec_net.requests[prev_infer].outputs[bn]
+                    probs=res_pb[0][0]
+                    #infer_time.append((time()-t0)*1000)
+                    infer_time = (time.time() - t0)*1000
+                    is_inference_done = True
+                    avg_time = round((infer_time/args.number_iter), 1)
+                    time_images.append(avg_time)
+                    #log.info("Average running time of one iteration: {} ms".format(np.average(np.asarray(infer_time))))
+            cur_infer += 1
+            if cur_infer >= args.number_infer_requests:
+                cur_infer = 0
+            prev_infer += 1
+            if prev_infer >= args.number_infer_requests:
+                prev_infer = 0 #1 - args.number_infer_requests
+
+            if args.perf_counts:
+                perf_counts = exec_net.requests[0].get_perf_counts()
+                log.info("Performance counters:")
+                print("{:<70} {:<15} {:<15} {:<15} {:<10}".format('name', 'layer_type', 'exet_type', 'status', 'real_time, us'))
+                for layer, stats in perf_counts.items():
+                    print("{:<70} {:<15} {:<15} {:<15} {:<10}".format(layer, stats['layer_type'], stats['exec_type'],
                                                                   stats['status'], stats['real_time']))
-        res_pb = res[out_blob]
-        probs=res_pb[0][0]
-        print("Probability of having disease= "+str(probs)+", performed in " + str(np.average(np.asarray(infer_time))) +" ms")
-        
-        # Class Activation Map    
-        t0 = time.time()
-        cam=class_activation_map_openvino(res, bn, fc , net, fp16)
-        cam_time=(time.time() - t0) * 1000
-        print("Time for CAM: {} ms".format(cam_time))
+        if is_inference_done:
+            # Class Activation Map    
+            t0 = time.time()
+            cam=class_activation_map_openvino(res, res_bn, fc , net, fp16)
+            cam_time=(time.time() - t0) * 1000
+            print("Time for CAM: {} ms".format(cam_time))
 
+            fig,ax = plt.subplots(1,2)
+            # Visualize the CAM heatmap
+            cam = (cam - np.min(cam))/(np.max(cam)-np.min(cam))
+            im=ax[0].imshow(cam, cmap=colormap)
+            ax[0].axis('off')
+            plt.colorbar(im,ax=ax[0],fraction=0.046, pad=0.04)
 
-        fig,ax = plt.subplots(1,2)
-        # Visualize the CAM heatmap
-        cam = (cam - np.min(cam))/(np.max(cam)-np.min(cam))
-        im=ax[0].imshow(cam, cmap=colormap)
-        ax[0].axis('off')
-        plt.colorbar(im,ax=ax[0],fraction=0.046, pad=0.04)
-
-        # Visualize the CAM overlaid over the X-ray image 
-        colormap_val=cm.get_cmap(colormap)  
-        imss=np.uint8(colormap_val(cam)*255)
-        im = Image.fromarray(imss)
-        width, height = image.size
-        cam1=resize_image(im, (height,width))
-        heatmap = np.asarray(cam1)
-        img1 = heatmap [:,:,:3] * 0.3 + image
-        ax[1].imshow(np.uint16(img1))
-        plt.xticks([]), plt.yticks([])  # to hide tick values on X and Y axis
-        plt.savefig(os.path.join(args.output_dir, 'result'+job_id+'_'+str(index_f)+'.png'), bbox_inches='tight', pad_inches=0,dpi=300)
+            # Visualize the CAM overlaid over the X-ray image 
+            colormap_val=cm.get_cmap(colormap)  
+            imss=np.uint8(colormap_val(cam)*255)
+            im = Image.fromarray(imss)
+            width, height = image.size
+            cam1=resize_image(im, (height,width))
+            heatmap = np.asarray(cam1)
+            img1 = heatmap [:,:,:3] * 0.3 + image
+            ax[1].imshow(np.uint16(img1))
+            plt.xticks([]), plt.yticks([])  # to hide tick values on X and Y axis
+            plt.savefig(os.path.join(args.output_dir, 'result'+job_id+'_'+str(index_f)+'.png'), bbox_inches='tight', pad_inches=0,dpi=300)
        
-        avg_time = round((infer_time/args.number_iter), 1)
+            #avg_time = round((infer_time/args.number_iter), 1)
         
-                    #f.write(res + "\n Inference performed in " + str(np.average(np.asarray(infer_time))) + "ms") 
-        f.write("Pneumonia probability: "+ str(probs) + ", Inference performed in " + str(avg_time) + "ms \n") 
-        time_images.append(avg_time)
-        simpleProgressUpdate(progress_file_path,index_f* avg_time , (len(files)-1)* avg_time) 
+            #f.write(res + "\n Inference performed in " + str(np.average(np.asarray(infer_time))) + "ms") 
+            f.write("Pneumonia probability: "+ str(probs) + ", Inference performed in " + str(avg_time) + "ms \n") 
+            #time_images.append(avg_time)
+            simpleProgressUpdate(progress_file_path,index_f* avg_time , (len(files)-1)* avg_time)
+    
     f1.write(str(np.average(np.asarray(time_images)))+'\n')
     f1.write(str(1))
+ 
+
+        
+    
 
 if __name__ == '__main__':
     sys.exit(main() or 0)

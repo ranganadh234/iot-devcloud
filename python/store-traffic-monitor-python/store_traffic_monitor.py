@@ -72,12 +72,14 @@ model_xml = ''
 model_bin = ''
 labels_file = ''
 videoCaps = []
+#videoCaps = {}
 display_lock = threading.Lock()
 log_lock = threading.Lock()
 frames = 0
 frameNames = []
 numVids = 20000
-acceptedDevices= ['CPU', 'GPU', 'MYRIAD']
+number_infer_requests = 2
+acceptedDevices= ['CPU', 'GPU', 'MYRIAD', 'HDDL']
 
 ##########################################################
 # CLASSES
@@ -89,7 +91,7 @@ class FrameInfo:
         self.timestamp = timestamp
 
 class VideoCap:
-    def __init__(self, cap, req_label, cap_name, is_cam):
+    def __init__(self, cap, req_label, cap_name, is_cam, file_name):
         self.cap = cap
         self.req_label = req_label
         self.cap_name = cap_name
@@ -108,6 +110,7 @@ class VideoCap:
         self.countAtFrame = []
         self.video = None
         self.rate = 0
+        self.file_name = file_name
 
         if not is_cam:
             self.fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -158,8 +161,10 @@ def args_parser():
     parser.add_argument("-c", "--config_file", help = "Path to config file", type = str, default = None)
     parser.add_argument("-n", "--num_videos", help = "Number of videos to process", type = int, default = None)
     parser.add_argument("-o", "--output_dir", help = "Path to output directory", type = str, default = None)
+    parser.add_argument("-nireq", "--number_infer_requests", help='Number of parallel inference requests (default is 2).',
+                        type=int, required=False, default=2)
 
-    global model_xml, model_bin, TARGET_DEVICE, labels_file, CPU_EXTENSION, LOOP_VIDEO, config_file, num_videos, output_dir
+    global model_xml, model_bin, TARGET_DEVICE, labels_file, CPU_EXTENSION, LOOP_VIDEO, config_file, num_videos, output_dir, number_infer_requests
 
     args = parser.parse_args()
     if args.model:
@@ -183,6 +188,8 @@ def args_parser():
         num_videos = args.num_videos
     if args.output_dir:
         output_dir = args.output_dir
+    if args.number_infer_requests:
+        number_infer_requests = args.number_infer_requests
 
 
 def check_args(defaultTarget=None):
@@ -215,10 +222,11 @@ def parse_conf_file():
             if cnt < num_videos:
                 split = item.split()
                 if split[0].isdigit():
-                    videoCap = VideoCap(cv2.VideoCapture(int(split[0])), split[1], CAM_WINDOW_NAME_TEMPLATE.format(idx), True)
+                    print (str(split[0]))
+                    videoCap = VideoCap(cv2.VideoCapture(int(split[0])), split[1], CAM_WINDOW_NAME_TEMPLATE.format(idx), True, str(split[0]))
                 else:
                     if os.path.isfile(split[0]) :
-                        videoCap = VideoCap(cv2.VideoCapture(split[0]), split[1], CAM_WINDOW_NAME_TEMPLATE.format(idx), False)
+                        videoCap = VideoCap(cv2.VideoCapture(split[0]), split[1], CAM_WINDOW_NAME_TEMPLATE.format(idx), False, split[0])
                     else:
                         print ("Couldn't find " + split[0])
                         sys.exit(3)
@@ -227,6 +235,7 @@ def parse_conf_file():
             else:
                 break
 
+    #for vc in videoCaps:
     for vc in videoCaps:
         if not vc.cap.isOpened():
             print ("Could not open for reading " + vc.cap_name)
@@ -345,7 +354,7 @@ def main():
     # Load the IR
     print("Loading IR to the plugin...")
     #exec_net = plugin.load(network=net, num_requests=2)
-    exec_net = ie.load_network(network=net, num_requests=2, device_name=TARGET_DEVICE)
+    exec_net = ie.load_network(network=net, num_requests=number_infer_requests, device_name=TARGET_DEVICE)
     # Read and pre-process input image
     n, c, h, w = net.inputs[input_blob].shape
     del net
@@ -358,7 +367,7 @@ def main():
     waitTime = int(round(1000 / minFPS / len(videoCaps))) # wait time in ms between showing frames
     frames_sum = 0
     for vc in videoCaps:
-        vc.init_vw(h, w, minFPS)
+        #vc.init_vw(h, w, minFPS)
         frames_sum += vc.length
     statsWidth = w if w > 345 else 345
     statsHeight = h if h > (len(videoCaps) * 20 + 15) else (len(videoCaps) * 20 + 15)
@@ -380,7 +389,7 @@ def main():
 
     # Init inference request IDs
     cur_request_id = 0
-    next_request_id = 1
+    next_request_id = 1 - number_infer_requests
     # Start with async mode enabled
     is_async_mode = True
 
@@ -395,73 +404,120 @@ def main():
         vc.start_time = datetime.datetime.now()
     frame_count = 0
     job_id = os.environ['PBS_JOBID']
+#     job_id = "__og_3__"
     progress_file_path = os.path.join(output_dir,'i_progress_'+job_id+'.txt')
+
+    output_files = {}
+    for cap in videoCaps:
+        #print (str(cap.file_name.split("/")[-1])+'.txt')
+        output_files[str(cap.file_name.split("/")[-1])+'.txt'] = open(os.path.join(output_dir, 'output_' + str(job_id) + '_'+str(cap.file_name.split("/")[-1])+'.txt'), 'w')
+
+    #print (output_files.items())
+
     infer_start_time = time.time()
-    
+    done_set = set() 
 #Start while loop
     while True:
         # If all video captures are closed stop the loop
         if False not in [videoCap.closed for videoCap in videoCaps]:
-            print("I broke here line 387")
+#             print("I broke here line 387")
             break
 
         no_more_data = False
 
         # loop over all video captures
+        #for idx, videoCapInfer in enumerate(videoCaps):
         for idx, videoCapInfer in enumerate(videoCaps):
             # read the next frame
             #print("Video {0} has length {1} and fps {2}".format(idx, videoCapInfer.length,  videoCapInfer.fps))
-            if not videoCapInfer.closed:
+            #if not videoCapInfer.closed:
+            if True:
                  #print("ID {0}".format(idx))
                  vfps = int(round(videoCapInfer.cap.get(cv2.CAP_PROP_FPS)))
                  #for i in range(0, int(round(vfps / minFPS))):
-                 for i in range(videoCapInfer.rate):
-                     frame_count += 1
+                 #for i in range(videoCapInfer.rate):
+                 #    frame_count += 1
                      #print("i = {0}".format(i))
-                     ret, frame = videoCapInfer.cap.read()
-                     videoCapInfer.cur_frame_count += 1
-                     # If the read failed close the program
-                     if not ret:
-                         videoCapInfer.closed = True
+                 ret, frame = videoCapInfer.cap.read()
+                 #if next_request_id >= 0:
+                 #     videoCapResult.cur_frame_count += 1
+                 
+                 # If the read failed close the program
+
+                 #if next_request_id >= 0 and videoCapResult.closed:
+                 #    #print("Video {0} is done".format(idx))
+                 #    print("Video {0} has  {1} frames ".format(videoCapResult.file_name, videoCapResult.length))
+                 #    break
+
+                 if ret:
+                     # Copy the current frame for later use
+                     videoCapInfer.cur_frame = frame.copy()
+                     videoCapInfer.initial_w = videoCapInfer.cap.get(3)
+                     videoCapInfer.initial_h = videoCapInfer.cap.get(4)
+                     # Resize and change the data layout so it is compatible
+                     in_frame = cv2.resize(videoCapInfer.cur_frame, (w, h))
+                     in_frame = in_frame.transpose((2, 0, 1))  # Change data layout from HWC to CHW
+                     in_frame = in_frame.reshape((n, c, h, w))
+
+                     infer_start = datetime.datetime.now()
+        
+                     #exec_net.start_async(request_id=next_request_id, inputs={input_blob: in_frame})
+                     #print ("cur_request_id:", cur_request_id)
+                     exec_net.start_async(request_id=cur_request_id, inputs={input_blob: in_frame})
+                 if(len(videoCaps) == 1):
+                     videoCapResult = videoCapInfer
+                     # Async enabled and more than one video capture
+                 else:
+                     videoCapResult = videoCaps[idx - 1 if idx - 1 >= 0 else len(videoCaps) - 1]
+                         #print (videoCaps)
+                         #videoCapResult = videoCaps[idx - 1 if idx - 1 >= 0 else len(videoCaps) - 1]
+                         # Get previous index
+                         #if next_request_id >= 0:
+                         #    print ("Video cap result: " + str(idx - 1 if idx - 1 >= 0 else len(videoCaps) - 1) + videoCapResult.file_name + ", video cap infer: " + str(idx) + videoCapInfer.file_name)
+
+                     #if is_async_mode:
+                     #    exec_net.start_async(request_id=next_request_id, inputs={input_blob: in_frame})
+                     #    # Async enabled and only one video capture
+                     #    if(len(videoCaps) == 1):
+                     #        videoCapResult = videoCapInfer
+                     #        # Async enabled and more than one video capture
+                     #    else:
+                     #        # Get previous index
+                     #        videoCapResult = videoCaps[idx - 1 if idx - 1 >= 0 else len(videoCaps) - 1]
+                     #else:
+                     #    # Async disabled
+                     #    exec_net.start_async(request_id=cur_request_id, inputs={input_blob: in_frame})
+                     #    videoCapResult = videoCapInfer
+                 
+                 #if exec_net.requests[cur_request_id].wait(-1) == 0:
+                 if next_request_id >= 0 and not videoCapResult.closed:
+                     #print ("next_request_id:", next_request_id)
+                     #print (len(done_set), len(videoCaps), len(done_set) is len(videoCaps))
+                     if len(done_set) is len(videoCaps):
                          no_more_data = True
                          break
-
-
-                 if videoCapInfer.closed:
-                     print("Video {0} is done".format(idx))
-                     print("Video has  {0} frames ".format(videoCapInfer.length))
-                     break
-
-                 # Copy the current frame for later use
-                 videoCapInfer.cur_frame = frame.copy()
-                 videoCapInfer.initial_w = videoCapInfer.cap.get(3)
-                 videoCapInfer.initial_h = videoCapInfer.cap.get(4)
-                 # Resize and change the data layout so it is compatible
-                 in_frame = cv2.resize(videoCapInfer.cur_frame, (w, h))
-                 in_frame = in_frame.transpose((2, 0, 1))  # Change data layout from HWC to CHW
-                 in_frame = in_frame.reshape((n, c, h, w))
-
-                 infer_start = datetime.datetime.now()
-                 if is_async_mode:
-                     exec_net.start_async(request_id=next_request_id, inputs={input_blob: in_frame})
-                     # Async enabled and only one video capture
-                     if(len(videoCaps) == 1):
-                         videoCapResult = videoCapInfer
-                     # Async enabled and more than one video capture
+                     if videoCapResult.cur_frame_count >= videoCapResult.length:
+                         done_set.add(videoCapResult.file_name)
+                         videoCapResult.closed = True
+                     #    print (done_set, videoCapResult.cur_frame_count)
+                         cur_request_id += 1 
+                         if cur_request_id >= number_infer_requests:
+                             cur_request_id = 0
+                         next_request_id += 1
+                         if next_request_id >= number_infer_requests:
+                             next_request_id = 0
+                         continue
                      else:
-                         # Get previous index
-                         videoCapResult = videoCaps[idx - 1 if idx - 1 >= 0 else len(videoCaps) - 1]
-                 else:
-                     # Async disabled
-                     exec_net.start_async(request_id=cur_request_id, inputs={input_blob: in_frame})
-                     videoCapResult = videoCapInfer
-                 
-                 if exec_net.requests[cur_request_id].wait(-1) == 0:
+                         videoCapResult.cur_frame_count += 1                         
+                         frame_count += 1
                      infer_end = datetime.datetime.now()
                      infer_duration = infer_end - infer_start
                      current_count = 0
+                     #videoCapResult.cur_frame_count += 1
+                     exec_net.requests[next_request_id].wait(-1)
                      # Parse detection results of the current request
-                     res = exec_net.requests[cur_request_id].outputs[out_blob]
+                     res = exec_net.requests[next_request_id].outputs[out_blob]
+                     xmin = ymin = xmax = ymax = frame_id = current_count = est = 0
                      for obj in res[0][0]:
                          class_id = int(obj[1])
                          # Draw only objects when probability more than specified threshold
@@ -473,8 +529,29 @@ def main():
                              ymin = int(obj[4] * videoCapResult.initial_h)
                              xmax = int(obj[5] * videoCapResult.initial_w)
                              ymax = int(obj[6] * videoCapResult.initial_h)
+                             est = round(obj[2] * 100, 1)
                              # Draw box
-                             cv2.rectangle(videoCapResult.cur_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 4, 16)
+                             #cv2.rectangle(videoCapResult.cur_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 4, 16)
+                             # Draw box
+#                              cv2.rectangle(videoCapResult.cur_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 4, 16)
+                             dims = "{frame_id} {xmin} {ymin} {xmax} {ymax} {class_id} {current_count} {total_count} {est} {time} \n".format(
+                                        frame_id=videoCapResult.cur_frame_count, xmin=xmin, ymin=ymin, xmax=xmax,
+                                        ymax=ymax, class_id=videoCapResult.req_label, current_count="N/A",
+                                        total_count=videoCapResult.total_count,est=est,time="N/A")
+                             output_files[videoCapResult.file_name.split("/")[-1]+".txt"].write(dims)
+
+#                              dims = "{frame_id} {xmin} {ymin} {xmax} {ymax} {class_id} {current_count} {total_count} {est}                                          {time} \n".format(frame_id=videoCapResult.cur_frame_count, xmin=xmin, ymin=ymin,                                                   xmax=xmax,ymax=ymax,class_id=videoCapResult.req_label,current_count="N/A",
+#                                         total_count=videoCapResult.total_count,est=est,time="N/A")
+#                              output_files[videoCapResult.file_name.split("/")[-1]+".txt"].write(dims)
+                     dims = "{frame_id} {xmin} {ymin} {xmax} {ymax} {class_id} {current_count} {total_count} {est} {time} \n".format(
+                                frame_id=videoCapResult.cur_frame_count, xmin=xmin, ymin=ymin, xmax=xmax,
+                                ymax=ymax, class_id=videoCapResult.req_label, current_count=current_count,
+                                total_count=videoCapResult.total_count,est=est,time="N/A")
+                     output_files[videoCapResult.file_name.split("/")[-1]+".txt"].write(dims)         
+#                      dims = "{frame_id} {xmin} {ymin} {xmax} {ymax} {class_id} {current_count} {total_count} {est} {time}                                    \n".format(frame_id=videoCapResult.cur_frame_count, xmin=xmin, ymin=ymin, xmax=xmax,
+#                                 ymax=ymax, class_id=videoCapResult.req_label, current_count=current_count,
+#                                 total_count=videoCapResult.total_count,est=est,time="N/A")
+#                      output_files[videoCapResult.file_name.split("/")[-1]+".txt"].write(dims)
 
                      if videoCapResult.candidate_count is current_count:
                          videoCapResult.candidate_confidence += 1
@@ -494,26 +571,26 @@ def main():
                                  videoCapResult.countAtFrame.append(fr)
                              new_objects = current_count - videoCapResult.last_correct_count
                              for _ in range(new_objects):
-                                 str = "{} - {} detected on {}".format(time.strftime("%H:%M:%S"), videoCapResult.req_label, videoCapResult.cap_name)
-                                 rolling_log.append(str)
+                                 str_ = "{} - {} detected on {}".format(time.strftime("%H:%M:%S"), videoCapResult.req_label, videoCapResult.cap_name)
+                                 rolling_log.append(str_)
 
                          videoCapResult.frames+=1
                          videoCapResult.last_correct_count = current_count
                      else:
                          videoCapResult.frames+=1
 
-                     videoCapResult.cur_frame = cv2.resize(videoCapResult.cur_frame, (w, h))
+                     #videoCapResult.cur_frame = cv2.resize(videoCapResult.cur_frame, (w, h))
 
                      if not UI_OUTPUT:
                          # Add log text to each frame
-                         log_message = "Async mode is on." if is_async_mode else \
-                                       "Async mode is off."
-                         cv2.putText(videoCapResult.cur_frame, log_message, (15, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                         log_message = "Total {} count: {}".format(videoCapResult.req_label, videoCapResult.total_count)
-                         cv2.putText(videoCapResult.cur_frame, log_message, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                         log_message = "Current {} count: {}".format(videoCapResult.req_label, videoCapResult.last_correct_count)
-                         cv2.putText(videoCapResult.cur_frame, log_message, (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                         cv2.putText(videoCapResult.cur_frame, 'Infer wait: %0.3fs' % (infer_duration.total_seconds()), (10, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                         #log_message = "Async mode is on." if is_async_mode else \
+                         #              "Async mode is off."
+                         #cv2.putText(videoCapResult.cur_frame, log_message, (15, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                         #log_message = "Total {} count: {}".format(videoCapResult.req_label, videoCapResult.total_count)
+                         #cv2.putText(videoCapResult.cur_frame, log_message, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                         #log_message = "Current {} count: {}".format(videoCapResult.req_label, videoCapResult.last_correct_count)
+                         #cv2.putText(videoCapResult.cur_frame, log_message, (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                         #cv2.putText(videoCapResult.cur_frame, 'Infer wait: %0.3fs' % (infer_duration.total_seconds()), (10, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                      
                          # Display inferred frame and stats
                          stats = numpy.zeros((statsHeight, statsWidth, 1), dtype = 'uint8')
@@ -522,49 +599,59 @@ def main():
                          #cv2.imshow(STATS_WINDOW_NAME, stats)
                          if idx == 0:
                              stats = cv2.cvtColor(stats, cv2.COLOR_GRAY2BGR)
-                             #Write
+                         #    #Write
                              statsVideo.write(stats)
-                         end_time = datetime.datetime.now()
-                         cv2.putText(videoCapResult.cur_frame, 'FPS: %0.2fs' % (1 / (end_time - videoCapResult.start_time).total_seconds()), (10, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                         #end_time = datetime.datetime.now()
+                         #cv2.putText(videoCapResult.cur_frame, 'FPS: %0.2fs' % (1 / (end_time - videoCapResult.start_time).total_seconds()), (10, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                          #cv2.imshow(videoCapResult.cap_name, videoCapResult.cur_frame)
-                         videoCapResult.start_time = datetime.datetime.now()
+                         #videoCapResult.start_time = datetime.datetime.now()
                          #Write
-                         videoCapResult.video.write(videoCapResult.cur_frame)
+                         #videoCapResult.video.write(videoCapResult.cur_frame)
                       
             if frame_count%10 == 0: 
-                progressUpdate(progress_file_path, time.time()-infer_start_time, frame_count, frames_sum) 
+                progressUpdate(progress_file_path, time.time()-infer_start_time, frame_count+1, frames_sum+1) 
+
+            if is_async_mode:
+                cur_request_id += 1
+                if cur_request_id >= number_infer_requests:
+                    cur_request_id = 0
+                next_request_id += 1
+                if next_request_id >= number_infer_requests:
+                    next_request_id = 0
+
 
 
             # Wait if necessary for the required time
             #key = cv2.waitKey(waitTime)
-            key = cv2.waitKey(1)
-            
-            # Esc key pressed
-            if key == 27:
-                cv2.destroyAllWindows()
-                del exec_net
-                #del plugin
-                del ie
-                print("Finished")
-                return
-            # Tab key pressed
-            if key == 9:
-                is_async_mode = not is_async_mode
-                print("Switched to {} mode".format("async" if is_async_mode else "sync"))
-
-            if is_async_mode:
-                # Swap infer request IDs
-                cur_request_id, next_request_id = next_request_id, cur_request_id
-
+            #key = cv2.waitKey(1)
+            #
+            ## Esc key pressed
+            #if key == 27:
+            #    cv2.destroyAllWindows()
+            #    del exec_net
+            #    #del plugin
+            #    del ie
+            #    print("Finished")
+            #    return
+            ## Tab key pressed
+            #if key == 9:
+            #    is_async_mode = not is_async_mode
+            #    print("Switched to {} mode".format("async" if is_async_mode else "sync"))
+            #
+            #if is_async_mode:
+            #    # Swap infer request IDs
+            #    cur_request_id, next_request_id = next_request_id, cur_request_id
+            #
             # Loop video if LOOP_VIDEO = True and input isn't live from USB camera
-            if LOOP_VIDEO and not videoCapInfer.is_cam:
-                vfps = int(round(videoCapInfer.cap.get(cv2.CAP_PROP_FPS)))
-                # If a video capture has ended restart it
-                if (videoCapInfer.cur_frame_count > videoCapInfer.cap.get(cv2.CAP_PROP_FRAME_COUNT) - int(round(vfps / minFPS))):
-                    videoCapInfer.cur_frame_count = 0
-                    videoCapInfer.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            #if LOOP_VIDEO and not videoCapInfer.is_cam:
+            #    vfps = int(round(videoCapInfer.cap.get(cv2.CAP_PROP_FPS)))
+            #    # If a video capture has ended restart it
+            #    if (videoCapInfer.cur_frame_count > videoCapInfer.cap.get(cv2.CAP_PROP_FRAME_COUNT) - int(round(vfps / minFPS))):
+            #        videoCapInfer.cur_frame_count = 0
+            #        videoCapInfer.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         
         if no_more_data:
+            print ("************************************************Should exit here")
             progressUpdate(progress_file_path, time.time()-infer_start_time, frames_sum, frames_sum) 
             break
 #End of while loop--------------------
@@ -588,7 +675,7 @@ def main():
 
 
     for vc in videoCaps:
-        vc.video.release()
+        #vc.video.release()
         vc.cap.release()
 
         if no_more_data:
